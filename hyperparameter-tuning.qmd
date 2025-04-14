@@ -1,0 +1,244 @@
+---
+title: "ESS-330 Lab 8"
+author: Alex Smilor
+format:
+   html:
+    code-fold: true
+    toc: true
+    self-contained: true
+execute: 
+  echo: true
+project:
+  output-dir: docs
+---
+## Data Import/Tidy/Transform
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(glue)
+library(powerjoin)
+library(vip)
+library(baguette)
+library(patchwork)
+library(ggpubr)
+library(visdat)
+library(skimr)
+
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+camels <- power_full_join(camels ,by = 'gauge_id')
+
+#Data cleaning and EDA
+glimpse(camels)
+vis_dat(camels)
+skim(camels)
+
+camels_clean <- camels %>% 
+  drop_na()
+
+#Visual EDA
+# Create a scatter plot of mean daily discharge vs mean daily rainfall
+ggplot(camels_clean, aes(x = p_mean, y = q_mean)) +
+  # Add points colored by mean flow
+  geom_point(aes(color = low_prec_freq)) +
+  # Add a linear regression line
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  # Apply the viridis color scale
+  scale_color_viridis_c() +
+  # Add a title, axis labels, and theme (w/ legend on the bottom)
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Rainfall vs Discharge vs Low Precipitation Frequency", 
+       x = "Mean Daily Precipitation", 
+       y = "Mean Daily Discharge",
+       color = "Frequency of Low Precipitation")
+```
+
+## Data Spliting
+```{r}
+set.seed(101)
+camels_split <- initial_split(camels_clean, prop = 0.80)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+```
+
+## Feature Engineering
+```{r}
+rec_flow <- recipe(q_mean ~ low_prec_freq + p_mean, data = camels_train) %>%
+  # Add an interaction term between low_prec_freq and p_mean
+  step_interact(terms = ~ low_prec_freq:p_mean) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+## Resampling and Model Testing
+### 1. Build resamples
+```{r}
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+### 2. Build 3 Candidate Models
+```{r}
+#Linear Regression Model
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+# Instantiate a workflow ...
+lm_wf <- workflow() %>%
+  add_recipe(rec_flow) %>%
+  add_model(lm_model) %>%
+  fit(data = camels_train)
+
+#Random Forests Model
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+# Instantiate a workflow ...
+rf_wf <- workflow() %>%
+  add_recipe(rec_flow) %>%
+  add_model(rf_model) %>%
+  fit(data = camels_train)
+
+#Random Forests Model
+xg_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+# Instantiate a workflow ...
+xg_wf <- workflow() %>%
+  add_recipe(rec_flow) %>%
+  add_model(xg_model) %>%
+  fit(data = camels_train)
+```
+
+### 3. Test the models
+```{r}
+wf <- workflow_set(list(rec_flow), list(lm_model, rf_model, xg_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+autoplot(wf)
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+
+### 4. Model Selection
+The Random forest model performed best of the tree models tested, with an r-squared value of about 0.885, which was slightly higher than the performance of the other models and suggests that 88% of all variance in the data are explained by this model. Though this model had a slightly higher RMSE than the linear regression model, the difference is small (<0.01).
+
+For this problem, I chose to use a random forest model with the ranger engine and the regression mode. This worked well for this problem because random forest models are often more accurate than other models due to how they combine many decision trees to improve performance and reduce variance. 
+
+## Model Tuning
+### 1. Build a model for your chosen specification.
+```{r}
+rf_mod_tune <- rand_forest(trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+```
+
+### 2. Create a workflow
+```{r}
+wf_tune <-  workflow(rec_flow, rf_mod_tune) 
+```
+
+### 3. Check The Tunable Values / Ranges
+```{r}
+dials <- extract_parameter_set_dials(wf_tune) 
+dials$object
+```
+
+### 4. Define the Search Space
+```{r}
+my.grid <- dials %>% 
+  grid_space_filling(size = 25, type = "latin_hypercube")
+```
+
+### 5. Tune the Model
+```{r}
+model_params <-  tune_grid(
+    wf_tune,
+    resamples = camels_cv,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE)
+  )
+
+autoplot(model_params)
+```
+Here, we see how the the number of trees affect various different metrics of model performance. The number of trees appears to have some effect on model performance, with it being much more variable at low and very high numbers of trees, but relatively stable and high performing at more central values, especially between 1000-1500 trees. The minimal node size has a similar, but much clearer effect. At low minimal node sizes and very high node sizes, model performance drops substantially. Around the middle between 10 and 25 as the minimal node size, the model performs best.
+
+### 6. Check the skill of the tuned model
+```{r}
+model_params %>% 
+  collect_metrics() %>%
+  filter(.metric=="mae") %>% 
+  arrange((mean))
+
+show_best(model_params,
+          metric = "mae")
+```
+The `show_best` function shows be hyperparameter values, the selected metric, the mean of that metric, the number of samples, and the standard error, along with the model number. According to this selection, the best hyperparameter set is from model 19, with 912 trees and a minimum node size of 11. This hyperparameter set has a mean absolute error of 0.327, meaning that the average error between the predicted and actual values is relatively small. 
+
+```{r}
+hp_best <- select_best(model_params,
+            metric = "mae")
+```
+
+### 7. Finalize your model
+```{r}
+final_wf <- finalize_workflow(wf_tune, hp_best)
+```
+
+## Final Model Verification
+```{r}
+final_fit <- last_fit(final_wf, camels_split, metrics = metric_set(rmse, rsq, mae))
+collect_metrics(final_fit)
+```
+
+The final model still performs fairly well, but performs slightly worse on the test data than the training data. The model accounts for 88.7% of the variance in the dataset and the mean absolute error between the predicted and actual values is 0.34. Additionally, the model's root mean squared error, or the prediction error in the same unit as the dependent variable, is 0.526. The RSME and MAE values are slightly higher than they were in the training data, while the r-squared is slightly lower.
+
+```{r}
+collect_predictions(final_fit) %>% 
+  ggplot(aes(x = .pred, y = q_mean)) + 
+  geom_point(aes(color = q_mean)) +
+  scale_color_viridis_c() +
+  geom_abline() + 
+  geom_smooth(method = "lm") + 
+  theme_linedraw() + 
+  labs(title = "Final Fit", 
+       x = "Predicted", 
+       y = "Actual",
+       color = "Mean Daily Discharge")
+```
+
+## Building a Map!
+```{r}
+final <- fit(final_wf, data = camels_clean) %>% 
+  augment(new_data = camels_clean) %>% 
+  mutate(residuals = .pred - q_mean)
+
+pred_plot <- final %>% 
+  ggplot(aes(x=gauge_lon, y = gauge_lat))+
+  borders("state", colour = "gray") +
+  geom_point(aes(color = .pred)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+  labs(colour = "Predicted Daily Discharge",
+       title = "Predicted Values of Daily Mean Discharge Across the US")
+
+resid_plot <- final %>% 
+  ggplot(aes(x=gauge_lon, y = gauge_lat))+
+  borders("state", colour = "gray") +
+  geom_point(aes(color = residuals)) +
+  scale_color_gradient(low = "goldenrod1", high = "orchid4") +
+  ggthemes::theme_map() +
+  labs(colour = "Residuals",
+       title = "Residuals of Predicted vs Actual Daily Mean Discharge Across the US")
+
+pred_plot / resid_plot
+```
+
